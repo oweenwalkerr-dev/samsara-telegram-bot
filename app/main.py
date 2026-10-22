@@ -93,7 +93,7 @@ async def samsara_webhook(
     return Response(status_code=200)
 
 
-@app.post("/test/telegram")
+@app.api_route("/test/telegram", methods=["GET", "POST"])
 async def test_telegram(message: str = "Samsara bot is online ✅") -> dict[str, Any]:
     """Manual smoke test: POST /test/telegram"""
     assert telegram is not None
