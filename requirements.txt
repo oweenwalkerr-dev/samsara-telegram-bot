@@ -7,3 +7,4 @@ python-dotenv==1.0.1
 apscheduler==3.10.4
 Pillow==11.1.0
 matplotlib==3.10.0
+tzdata==2025.2
