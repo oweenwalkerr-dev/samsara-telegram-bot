@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from datetime import timezone, tzinfo
 from functools import lru_cache
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -22,7 +24,14 @@ class Settings(BaseSettings):
     telegram_chat_id: str = ""
 
     # JSON object: {"Speeding": 123, "Crash": 456, ...}
+    # Topics are now created automatically; paste the map the app logs / returns
+    # from /setup/topics here so it survives restarts and redeploys.
     topic_map: str = "{}"
+    # Best-effort local copy of the topic map (lost on redeploy on most hosts).
+    topics_file: str = "topics.json"
+
+    # Timezone used for the "Time:" line in alerts
+    display_timezone: str = "America/Chicago"
 
     safety_poll_seconds: int = 45
     port: int = 8080
@@ -40,6 +49,12 @@ class Settings(BaseSettings):
                 except (TypeError, ValueError):
                     continue
         return out
+
+    def display_tz(self) -> tzinfo:
+        try:
+            return ZoneInfo(self.display_timezone)
+        except Exception:
+            return timezone.utc
 
 
 @lru_cache

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
@@ -8,28 +9,36 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 
 from app.config import get_settings
 from app.formatters import format_webhook_alert
+from app.publisher import Publisher
 from app.safety_poller import SafetyPoller
 from app.samsara_client import SamsaraClient
 from app.telegram_client import TelegramClient
+from app.topics import TopicManager
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("app")
+# httpx logs full request URLs at INFO, which would put the Telegram bot token in the logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 settings = get_settings()
 samsara: SamsaraClient | None = None
 telegram: TelegramClient | None = None
 poller: SafetyPoller | None = None
+topics: TopicManager | None = None
+publisher: Publisher | None = None
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global samsara, telegram, poller
+    global samsara, telegram, poller, topics, publisher
     samsara = SamsaraClient(settings)
     telegram = TelegramClient(settings)
-    poller = SafetyPoller(settings, samsara, telegram)
+    topics = TopicManager(settings, telegram)
+    publisher = Publisher(telegram, topics)
+    poller = SafetyPoller(settings, samsara, publisher)
     poller.start()
     logger.info("App started. Chat ID=%s", settings.telegram_chat_id)
     yield
@@ -56,7 +65,7 @@ async def samsara_webhook(
     x_samsara_signature: str | None = Header(default=None),
     x_samsara_event_type: str | None = Header(default=None),
 ) -> Response:
-    assert samsara is not None and telegram is not None
+    assert samsara is not None and publisher is not None
 
     body = await request.body()
 
@@ -82,22 +91,29 @@ async def samsara_webhook(
     if event_type == "Ping":
         return Response(status_code=200)
 
-    topic_key, text = format_webhook_alert(payload)
-    topics = settings.topic_ids()
-    thread_id = topics.get(topic_key) or topics.get("General")
-
-    result = await telegram.send_message(text, thread_id=thread_id)
-    if not result.get("ok"):
-        logger.error("Failed to send telegram message: %s", result)
+    topic_key, text = format_webhook_alert(payload, tz=settings.display_tz())
+    ok = await publisher.publish(topic_key, text)
+    if not ok:
+        logger.error("Failed to send telegram message for webhook event %s", event_type)
         # Still 200 so Samsara does not retry forever on formatting bugs
     return Response(status_code=200)
 
 
-@app.api_route("/test/telegram", methods=["GET", "POST"])
+@app.post("/test/telegram")
 async def test_telegram(message: str = "Samsara bot is online ✅") -> dict[str, Any]:
     """Manual smoke test: POST /test/telegram"""
     assert telegram is not None
-    topics = settings.topic_ids()
-    thread_id = topics.get("General")
-    result = await telegram.send_message(message, thread_id=thread_id)
+    result = await telegram.send_message(message)
     return result
+
+
+@app.api_route("/setup/topics", methods=["GET", "POST"])
+async def setup_topics() -> dict[str, Any]:
+    """Create every alert topic that does not exist yet.
+
+    Returns the TOPIC_MAP value to paste into your host's environment variables
+    (so restarts and redeploys don't create duplicate topics).
+    """
+    assert topics is not None
+    mapping = await topics.ensure_all()
+    return {"TOPIC_MAP": json.dumps(mapping), "topics_created_or_known": len(mapping)}

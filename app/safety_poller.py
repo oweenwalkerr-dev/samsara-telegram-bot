@@ -1,16 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.config import Settings
 from app.formatters import extract_media_urls, format_safety_event
+from app.publisher import Publisher
 from app.samsara_client import SamsaraClient
-from app.telegram_client import TelegramClient
 
 logger = logging.getLogger(__name__)
+
+
+def _redact(obj: Any) -> Any:
+    """Hide video/download URLs (they are signed links) before logging a sample event."""
+    if isinstance(obj, dict):
+        return {
+            k: ("<url>" if "url" in k.lower() and isinstance(v, str) else _redact(v)) for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_redact(x) for x in obj]
+    return obj
 
 
 class SafetyPoller:
@@ -18,15 +30,17 @@ class SafetyPoller:
         self,
         settings: Settings,
         samsara: SamsaraClient,
-        telegram: TelegramClient,
+        publisher: Publisher,
     ) -> None:
         self.settings = settings
         self.samsara = samsara
-        self.telegram = telegram
+        self.publisher = publisher
+        self.tz = settings.display_tz()
         self._seen: set[str] = set()
         self._cursor: str | None = None
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
+        self._sample_logged = False
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -79,23 +93,24 @@ class SafetyPoller:
             if len(self._seen) > 5000:
                 self._seen = set(list(self._seen)[-2500:])
 
+            if not self._sample_logged:
+                # One-time look at the real payload shape (URLs hidden) to help debugging.
+                logger.info("Sample safety event: %s", json.dumps(_redact(event))[:1500])
+                self._sample_logged = True
+
             await self._publish_event(event)
 
     async def _publish_event(self, event: dict[str, Any]) -> None:
-        topic_key, caption = format_safety_event(event)
-        topics = self.settings.topic_ids()
-        thread_id = topics.get(topic_key) or topics.get("General")
+        vehicle_name, driver_name = await self.samsara.resolve_event_people(event)
+        topic_key, caption = format_safety_event(
+            event, vehicle_name=vehicle_name, driver_name=driver_name, tz=self.tz
+        )
 
-        media_urls = extract_media_urls(event)
-        sent = False
-        for url in media_urls[:1]:
-            blob = await self.samsara.download_bytes(url)
-            if blob and len(blob) < 48 * 1024 * 1024:
-                result = await self.telegram.send_video(blob, caption, thread_id=thread_id)
-                sent = bool(result.get("ok"))
-                if sent:
-                    break
+        blob: bytes | None = None
+        for url in extract_media_urls(event)[:1]:
+            data = await self.samsara.download_bytes(url)
+            if data and len(data) < 48 * 1024 * 1024:
+                blob = data
 
-        if not sent:
-            await self.telegram.send_message(caption, thread_id=thread_id)
-        logger.info("Published safety event %s -> %s", event.get("id"), topic_key)
+        ok = await self.publisher.publish(topic_key, caption, video=blob)
+        logger.info("Published safety event %s -> %s (ok=%s)", event.get("id"), topic_key, ok)

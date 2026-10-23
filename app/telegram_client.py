@@ -38,6 +38,12 @@ class TelegramClient:
             return {}
         return {"message_thread_id": thread_id}
 
+    async def create_forum_topic(self, name: str) -> dict[str, Any]:
+        return await self._post(
+            "createForumTopic",
+            data={"chat_id": self.settings.telegram_chat_id, "name": name[:128]},
+        )
+
     async def send_message(
         self,
         text: str,

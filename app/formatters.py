@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import html
-from datetime import datetime
+import logging
+import re
+from datetime import datetime, timezone, tzinfo
 from typing import Any
 
+logger = logging.getLogger(__name__)
 
 # Canonical keys used in TOPIC_MAP env
 LABEL_TO_TOPIC_KEY: dict[str, str] = {
@@ -37,52 +40,95 @@ LABEL_TO_TOPIC_KEY: dict[str, str] = {
     "dashcamdisconnected": "ObstructedCamera",
 }
 
+# Nicer display titles for labels whose raw name is vague
+_TITLE_OVERRIDES = {"braking": "Harsh Braking", "acceleration": "Harsh Acceleration"}
+
+
+def _compact(raw: str) -> str:
+    return raw.lower().replace(" ", "").replace("_", "")
+
+
+def pretty_title(raw: str) -> str:
+    """'FollowingDistance' -> 'Following Distance', 'Braking' -> 'Harsh Braking'."""
+    override = _TITLE_OVERRIDES.get(_compact(raw))
+    if override:
+        return override
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", raw.replace("_", " ")).strip()
+    spaced = spaced or raw
+    return spaced[:1].upper() + spaced[1:]
+
 
 def topic_key_from_labels(labels: list[str] | None) -> str:
     if not labels:
         return "General"
     for raw in labels:
-        key = LABEL_TO_TOPIC_KEY.get(raw.lower().replace(" ", "").replace("_", ""))
+        key = LABEL_TO_TOPIC_KEY.get(_compact(raw)) or LABEL_TO_TOPIC_KEY.get(raw.lower())
         if key:
             return key
-        key = LABEL_TO_TOPIC_KEY.get(raw.lower())
-        if key:
-            return key
+    logger.info("Unmapped safety label(s) %s -> General (add to LABEL_TO_TOPIC_KEY)", labels)
     return "General"
 
 
 def topic_key_from_alert_condition(condition_id: str | None) -> str:
     if not condition_id:
         return "General"
-    normalized = condition_id.lower().replace(" ", "").replace("_", "")
-    return LABEL_TO_TOPIC_KEY.get(normalized, "General")
+    return LABEL_TO_TOPIC_KEY.get(_compact(condition_id), "General")
 
 
 def _esc(value: Any) -> str:
-    if value is None:
+    if value is None or value == "":
         return "—"
     return html.escape(str(value))
 
 
-def _fmt_time(value: Any) -> str:
-    if not value:
-        return "—"
+def _to_dt(value: Any) -> datetime | None:
     if isinstance(value, (int, float)):
-        # ms or seconds
         ts = value / 1000 if value > 10_000_000_000 else value
         try:
-            return datetime.utcfromtimestamp(ts).strftime("%b %d, %Y %H:%M UTC")
-        except Exception:
-            return str(value)
-    text = str(value)
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
     try:
-        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        return dt.strftime("%b %d, %Y %H:%M %Z")
-    except Exception:
-        return text
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def format_safety_event(event: dict[str, Any]) -> tuple[str, str]:
+def _fmt_time(value: Any, tz: tzinfo = timezone.utc) -> str:
+    if not value:
+        return "—"
+    dt = _to_dt(value)
+    if dt is None:
+        return str(value)
+    local = dt.astimezone(tz)
+    clock = local.strftime("%I:%M %p").lstrip("0")
+    return f"{local.strftime('%b')} {local.day}, {clock} {local.strftime('%Z')}"
+
+
+def _location_line(location: Any) -> str:
+    if not isinstance(location, dict):
+        return "<b>Location:</b> —"
+    reverse = location.get("reverseGeo")
+    address = reverse.get("formattedLocation") if isinstance(reverse, dict) else None
+    lat, lon = location.get("latitude"), location.get("longitude")
+    link = f'<a href="https://maps.google.com/?q={lat},{lon}">Open map</a>' if lat is not None and lon is not None else ""
+    if address and link:
+        return f"<b>Location:</b> {_esc(address)} ({link})"
+    if address:
+        return f"<b>Location:</b> {_esc(address)}"
+    if link:
+        return f"<b>Location:</b> {link}"
+    return "<b>Location:</b> —"
+
+
+def format_safety_event(
+    event: dict[str, Any],
+    *,
+    vehicle_name: str | None = None,
+    driver_name: str | None = None,
+    tz: tzinfo = timezone.utc,
+) -> tuple[str, str]:
     """Return (topic_key, html_caption)."""
     labels = []
     for item in event.get("behaviorLabels") or []:
@@ -93,35 +139,29 @@ def format_safety_event(event: dict[str, Any]) -> tuple[str, str]:
     labels = [x for x in labels if x]
 
     topic = topic_key_from_labels(labels)
-    title = labels[0] if labels else event.get("type") or "Safety Event"
+    title = pretty_title(labels[0]) if labels else str(event.get("type") or "Safety Event")
 
-    driver = event.get("driver") or {}
-    vehicle = event.get("vehicle") or event.get("asset") or {}
-    location = event.get("location") or {}
-
-    driver_name = driver.get("name") if isinstance(driver, dict) else None
-    vehicle_name = vehicle.get("name") if isinstance(vehicle, dict) else None
-    loc_text = None
-    if isinstance(location, dict):
-        loc_text = location.get("reverseGeo", {}).get("formattedLocation") if isinstance(
-            location.get("reverseGeo"), dict
-        ) else None
-        if not loc_text and location.get("latitude") is not None:
-            loc_text = f"{location.get('latitude')}, {location.get('longitude')}"
-
-    time_text = _fmt_time(event.get("time") or event.get("createdAtTime") or event.get("startTime"))
+    time_text = _fmt_time(event.get("time") or event.get("createdAtTime") or event.get("startTime"), tz)
 
     lines = [
         f"<b>🚨 {_esc(title)}</b>",
         f"<b>Vehicle:</b> {_esc(vehicle_name)}",
         f"<b>Driver:</b> {_esc(driver_name)}",
         f"<b>Time:</b> {_esc(time_text)}",
-        f"<b>Location:</b> {_esc(loc_text)}",
+        _location_line(event.get("location")),
     ]
 
-    speed = event.get("speedMilesPerHour") or event.get("vehicleSpeedMetersPerSecond")
-    if speed is not None:
-        lines.append(f"<b>Speed:</b> {_esc(speed)}")
+    mph = event.get("speedMilesPerHour")
+    if mph is None and event.get("vehicleSpeedMetersPerSecond") is not None:
+        try:
+            mph = float(event["vehicleSpeedMetersPerSecond"]) * 2.23694
+        except (TypeError, ValueError):
+            mph = None
+    if mph is not None:
+        try:
+            lines.append(f"<b>Speed:</b> {float(mph):.0f} mph")
+        except (TypeError, ValueError):
+            lines.append(f"<b>Speed:</b> {_esc(mph)}")
 
     if event.get("id"):
         lines.append(f"<i>Event ID: {_esc(event.get('id'))}</i>")
@@ -129,7 +169,7 @@ def format_safety_event(event: dict[str, Any]) -> tuple[str, str]:
     return topic, "\n".join(lines)
 
 
-def format_webhook_alert(payload: dict[str, Any]) -> tuple[str, str]:
+def format_webhook_alert(payload: dict[str, Any], tz: tzinfo = timezone.utc) -> tuple[str, str]:
     """Handle both Webhooks 1.0 Alert and 2.0 AlertIncident-ish payloads."""
     event = payload.get("event") or payload.get("data") or payload
     if not isinstance(event, dict):
@@ -155,11 +195,11 @@ def format_webhook_alert(payload: dict[str, Any]) -> tuple[str, str]:
     driver = event.get("driver") or {}
 
     lines = [
-        f"<b>⚡ {_esc(condition)}</b>",
+        f"<b>⚡ {_esc(pretty_title(str(condition)))}</b>",
         f"{_esc(summary)}",
         f"<b>Vehicle:</b> {_esc(device.get('name') if isinstance(device, dict) else device)}",
         f"<b>Driver:</b> {_esc(driver.get('name') if isinstance(driver, dict) else driver)}",
-        f"<b>Time:</b> {_esc(_fmt_time(event.get('startMs') or event.get('eventMs') or payload.get('eventTime')))}",
+        f"<b>Time:</b> {_esc(_fmt_time(event.get('startMs') or event.get('eventMs') or payload.get('eventTime'), tz))}",
     ]
 
     url = event.get("alertEventUrl") or event.get("incidentUrl")
