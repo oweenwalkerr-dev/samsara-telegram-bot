@@ -171,7 +171,8 @@ class SamsaraClient:
         driver_name = driver.get("name")
         if not driver_name:
             driver_id = driver.get("id") or event.get("driverId")
-            if driver_id:
+            # Samsara uses id "0" for "no driver assigned"
+            if driver_id and str(driver_id) != "0":
                 driver_name = await self._lookup_name("driver", driver_id)
             else:
                 driver_name = "Unassigned"

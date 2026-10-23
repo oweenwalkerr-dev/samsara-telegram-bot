@@ -109,8 +109,17 @@ def _fmt_time(value: Any, tz: tzinfo = timezone.utc) -> str:
 def _location_line(location: Any) -> str:
     if not isinstance(location, dict):
         return "<b>Location:</b> —"
-    reverse = location.get("reverseGeo")
-    address = reverse.get("formattedLocation") if isinstance(reverse, dict) else None
+    address = None
+    structured = location.get("address")
+    if isinstance(structured, dict):
+        street = " ".join(str(x) for x in (structured.get("streetNumber"), structured.get("street")) if x)
+        place = ", ".join(str(x) for x in (structured.get("city"), structured.get("state")) if x)
+        address = ", ".join(x for x in (street, place) if x) or None
+    elif isinstance(structured, str):
+        address = structured or None
+    if not address:
+        reverse = location.get("reverseGeo")
+        address = reverse.get("formattedLocation") if isinstance(reverse, dict) else None
     lat, lon = location.get("latitude"), location.get("longitude")
     link = f'<a href="https://maps.google.com/?q={lat},{lon}">Open map</a>' if lat is not None and lon is not None else ""
     if address and link:
