@@ -178,19 +178,118 @@ def format_safety_event(
     return topic, "\n".join(lines)
 
 
-def format_webhook_alert(payload: dict[str, Any], tz: tzinfo = timezone.utc) -> tuple[str, str]:
-    """Handle both Webhooks 1.0 Alert and 2.0 AlertIncident-ish payloads."""
+_SKIP_DETAIL_KEYS = {"vehicle", "driver", "trailer", "trailers", "tags", "asset"}
+
+
+def topic_key_from_text(text: str | None) -> str:
+    """Route a Samsara alert by its (human) name, e.g. 'Dash Cam Disconnected'."""
+    c = _compact(text or "")
+    if any(k in c for k in ("fault", "checkengine", "dtc", "diagnostic")):
+        return "FaultCodes"
+    if "battery" in c or "unplugged" in c:
+        return "BatteryVoltage"
+    if "dashcam" in c or "camera" in c:
+        return "ObstructedCamera"
+    if "speed" in c:
+        return "Speeding"
+    return "General"
+
+
+def _v2_incident(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Return (data, first_condition) for Webhooks 2.0 AlertIncident payloads."""
+    data = payload.get("data")
+    if isinstance(data, dict):
+        conditions = data.get("conditions")
+        if isinstance(conditions, list) and conditions and isinstance(conditions[0], dict):
+            return data, conditions[0]
+    return None
+
+
+def extract_people(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """(vehicle, driver) dicts from a Webhooks 2.0 alert, or ({}, {}) if not present."""
+    incident = _v2_incident(payload)
+    if not incident:
+        return {}, {}
+    details = incident[1].get("details")
+    if not isinstance(details, dict):
+        return {}, {}
+    vehicle = details.get("vehicle") if isinstance(details.get("vehicle"), dict) else {}
+    driver = details.get("driver") if isinstance(details.get("driver"), dict) else {}
+    if not driver and isinstance(vehicle.get("driver"), dict):
+        driver = vehicle["driver"]
+    return vehicle, driver
+
+
+def _detail_lines(details: Any, limit: int = 8) -> list[str]:
+    """Readable 'Key: value' lines from a condition's details object (schema varies per alert type)."""
+    if not isinstance(details, dict):
+        return []
+    flat: list[tuple[str, Any]] = []
+
+    def walk(obj: dict[str, Any], prefix: str = "") -> None:
+        for key, value in obj.items():
+            if key in _SKIP_DETAIL_KEYS:
+                continue
+            label = f"{prefix}{key}"
+            if isinstance(value, dict) and not prefix:
+                walk(value, prefix=f"{key} ")
+            elif isinstance(value, (str, int, float, bool)) and value != "":
+                flat.append((label, value))
+
+    walk(details)
+    lines = []
+    for label, value in flat[:limit]:
+        words = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", label.replace("_", " ")).split()
+        nice = " ".join(w[:1].upper() + w[1:] for w in words)
+        lines.append(f"<b>{_esc(nice)}:</b> {_esc(str(value)[:120])}")
+    return lines
+
+
+def format_webhook_alert(
+    payload: dict[str, Any],
+    tz: tzinfo = timezone.utc,
+    *,
+    vehicle_name: str | None = None,
+    driver_name: str | None = None,
+) -> tuple[str, str]:
+    """Format a Samsara alert webhook (2.0 AlertIncident, with a 1.0 fallback)."""
+    incident = _v2_incident(payload)
+    if incident:
+        data, condition = incident
+        names = [str(c.get("description")) for c in data["conditions"] if isinstance(c, dict) and c.get("description")]
+        title = ", ".join(dict.fromkeys(names)) or "Samsara alert"
+        topic = topic_key_from_text(" ".join(names))
+        resolved = bool(data.get("resolvedAtTime"))
+        when = data.get("happenedAtTime") or data.get("updatedAtTime") or payload.get("eventTime")
+
+        lines = [
+            f"<b>{'✅ Resolved: ' if resolved else '⚡ '}{_esc(title)}</b>",
+            f"<b>Vehicle:</b> {_esc(vehicle_name)}",
+        ]
+        if driver_name:
+            lines.append(f"<b>Driver:</b> {_esc(driver_name)}")
+        lines.append(f"<b>Time:</b> {_esc(_fmt_time(when, tz))}")
+        lines.extend(_detail_lines(condition.get("details")))
+        url = data.get("incidentUrl")
+        if url and str(url).startswith("http"):
+            lines.append(f'<a href="{html.escape(str(url))}">Open in Samsara</a>')
+        return topic, "\n".join(lines)
+
+    # ---- Webhooks 1.0 style payloads
     event = payload.get("event") or payload.get("data") or payload
     if not isinstance(event, dict):
         event = {}
 
-    condition = (
+    condition_id = (
         event.get("alertConditionId")
         or event.get("conditionId")
+        or event.get("alertConditionDescription")
         or payload.get("eventType")
         or "Alert"
     )
-    topic = topic_key_from_alert_condition(str(condition))
+    topic = topic_key_from_alert_condition(str(condition_id))
+    if topic == "General":
+        topic = topic_key_from_text(str(event.get("alertConditionDescription") or condition_id))
 
     summary = (
         event.get("summary")
@@ -204,10 +303,10 @@ def format_webhook_alert(payload: dict[str, Any], tz: tzinfo = timezone.utc) -> 
     driver = event.get("driver") or {}
 
     lines = [
-        f"<b>⚡ {_esc(pretty_title(str(condition)))}</b>",
+        f"<b>⚡ {_esc(pretty_title(str(condition_id)))}</b>",
         f"{_esc(summary)}",
-        f"<b>Vehicle:</b> {_esc(device.get('name') if isinstance(device, dict) else device)}",
-        f"<b>Driver:</b> {_esc(driver.get('name') if isinstance(driver, dict) else driver)}",
+        f"<b>Vehicle:</b> {_esc(vehicle_name or (device.get('name') if isinstance(device, dict) else device))}",
+        f"<b>Driver:</b> {_esc(driver_name or (driver.get('name') if isinstance(driver, dict) else driver))}",
         f"<b>Time:</b> {_esc(_fmt_time(event.get('startMs') or event.get('eventMs') or payload.get('eventTime'), tz))}",
     ]
 

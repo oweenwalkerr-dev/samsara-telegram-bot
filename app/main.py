@@ -8,7 +8,7 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 
 from app.config import get_settings
-from app.formatters import format_webhook_alert
+from app.formatters import extract_people, format_webhook_alert
 from app.publisher import Publisher
 from app.safety_poller import SafetyPoller
 from app.samsara_client import SamsaraClient
@@ -92,7 +92,23 @@ async def samsara_webhook(
     if event_type == "Ping":
         return Response(status_code=200)
 
-    topic_key, text = format_webhook_alert(payload, tz=settings.display_tz())
+    # Log what Samsara sent (helps when an alert type needs tuning)
+    logger.info("Webhook payload (%s): %s", event_type, json.dumps(payload)[:2000])
+
+    try:
+        vehicle, driver = extract_people(payload)
+        vehicle_name = driver_name = None
+        if vehicle or driver:
+            vehicle_name, driver_name = await samsara.resolve_event_people(
+                {"asset": vehicle or {}, "driver": driver or {}}
+            )
+        topic_key, text = format_webhook_alert(
+            payload, tz=settings.display_tz(), vehicle_name=vehicle_name, driver_name=driver_name
+        )
+    except Exception:
+        logger.exception("Could not format webhook payload")
+        topic_key, text = "General", "⚡ Samsara alert received (could not format it; see logs)"
+
     ok = await publisher.publish(topic_key, text)
     if not ok:
         logger.error("Failed to send telegram message for webhook event %s", event_type)
