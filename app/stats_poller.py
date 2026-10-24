@@ -6,6 +6,8 @@ import logging
 import time
 from typing import Any
 
+import httpx
+
 from app.config import Settings
 from app.formatters import _esc, _fmt_time, _location_line
 from app.publisher import Publisher
@@ -124,6 +126,7 @@ class StatsPoller:
         # battery state
         self._streak: dict[tuple[str, str], int] = {}
         self._battery_last_post: dict[tuple[str, str], float] = {}
+        self._backoff_until: dict[str, float] = {}
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
 
@@ -147,20 +150,28 @@ class StatsPoller:
         while not self._stop.is_set():
             if self.settings.samsara_api_token:
                 if self.settings.fault_alerts_enabled:
-                    await self._safe(self.poll_faults)
+                    await self._safe("faults", self.poll_faults)
                 if self.settings.battery_alerts_enabled:
-                    await self._safe(self.poll_battery)
+                    await self._safe("battery", self.poll_battery)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.settings.stats_poll_seconds)
             except asyncio.TimeoutError:
                 pass
 
-    @staticmethod
-    async def _safe(fn: Any) -> None:
+    async def _safe(self, name: str, fn: Any) -> None:
+        if time.monotonic() < self._backoff_until.get(name, 0.0):
+            return
         try:
             await fn()
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            logger.error("Stats %s check: Samsara returned %s: %s", name, status, exc.response.text[:500])
+            if 400 <= status < 500 and status != 429:
+                # Not going to fix itself: stop hammering the API and the logs for a while.
+                self._backoff_until[name] = time.monotonic() + 1800
+                logger.error("Stats %s check paused for 30 minutes; fix the cause above, then redeploy.", name)
         except Exception:
-            logger.exception("Stats poll failed (%s)", getattr(fn, "__name__", fn))
+            logger.exception("Stats %s check failed", name)
 
     async def _fetch_all(self, types: str, decorations: str | None = None) -> tuple[list[dict[str, Any]], bool]:
         """Read every page of the feed. Returns (rows, is_baseline)."""
