@@ -12,6 +12,7 @@ from app.formatters import extract_people, format_webhook_alert
 from app.publisher import Publisher
 from app.safety_poller import SafetyPoller
 from app.samsara_client import SamsaraClient
+from app.stats_poller import StatsPoller
 from app.telegram_client import TelegramClient
 from app.topics import TopicManager
 
@@ -27,23 +28,28 @@ settings = get_settings()
 samsara: SamsaraClient | None = None
 telegram: TelegramClient | None = None
 poller: SafetyPoller | None = None
+stats_poller: StatsPoller | None = None
 topics: TopicManager | None = None
 publisher: Publisher | None = None
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global samsara, telegram, poller, topics, publisher
+    global samsara, telegram, poller, stats_poller, topics, publisher
     samsara = SamsaraClient(settings)
     telegram = TelegramClient(settings)
     topics = TopicManager(settings, telegram)
     publisher = Publisher(telegram, topics)
     poller = SafetyPoller(settings, samsara, publisher)
     poller.start()
+    stats_poller = StatsPoller(settings, samsara, publisher)
+    stats_poller.start()
     logger.info("App started. Chat ID=%s", settings.telegram_chat_id)
     yield
     if poller:
         await poller.stop()
+    if stats_poller:
+        await stats_poller.stop()
     if samsara:
         await samsara.aclose()
     if telegram:

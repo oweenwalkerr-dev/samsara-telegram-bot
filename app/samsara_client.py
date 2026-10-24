@@ -110,6 +110,26 @@ class SamsaraClient:
             logger.warning("Media download failed: %s", exc)
             return None
 
+    async def get_stats_feed(
+        self,
+        *,
+        types: str,
+        after: str | None = None,
+        decorations: str | None = None,
+    ) -> dict[str, Any]:
+        """Follow the vehicle stats feed (e.g. types='faultCodes' or 'batteryMilliVolts').
+
+        Without `after` Samsara returns the last known values; with it, only new readings.
+        """
+        params: dict[str, str] = {"types": types}
+        if after:
+            params["after"] = after
+        if decorations:
+            params["decorations"] = decorations
+        resp = await self._client.get("/fleet/vehicles/stats/feed", params=params)
+        resp.raise_for_status()
+        return resp.json()
+
     # ------------------------------------------------------------------ names
     async def _list_all(self, path: str) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []

@@ -34,6 +34,16 @@ class Settings(BaseSettings):
     display_timezone: str = "America/Chicago"
 
     safety_poll_seconds: int = 45
+
+    # Fault codes + battery voltage (read directly from Samsara vehicle stats)
+    stats_poll_seconds: int = 60
+    fault_alerts_enabled: bool = True
+    fault_cooldown_hours: float = 12  # don't repeat the same code on the same truck within this time
+    battery_alerts_enabled: bool = True
+    battery_low_volts: float = 11.8
+    battery_high_volts: float = 15.0
+    battery_min_readings: int = 2  # consecutive readings beyond the limit (readings come ~every 2 min)
+    battery_cooldown_hours: float = 6
     port: int = 8080
 
     def topic_ids(self) -> dict[str, int]:
